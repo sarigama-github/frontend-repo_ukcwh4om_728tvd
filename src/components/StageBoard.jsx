@@ -1,7 +1,8 @@
-import { useEffect, useMemo, useState } from 'react'
-import { ChevronDown, CheckCircle2, Clock4, UploadCloud, UserPlus2, Download, FileCheck2, StickyNote } from 'lucide-react'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import { ChevronDown, CheckCircle2, Clock4, UploadCloud, UserPlus2, Download, FileCheck2, StickyNote, Link as LinkIcon, AlertTriangle } from 'lucide-react'
 
-const API = import.meta.env.VITE_BACKEND_URL || 'http://localhost:8000'
+// Attempt to determine API base automatically, but allow manual override
+const ENV_API = import.meta.env.VITE_BACKEND_URL
 
 function StageHeader({ title, description, checked, children }) {
   return (
@@ -90,60 +91,159 @@ function ItemRow({ stage, item, mode, onUpload, onAssign, onAction, logs }) {
   )
 }
 
+function useApiDiscovery() {
+  const [apiBase, setApiBase] = useState(null)
+  const [error, setError] = useState(null)
+
+  useEffect(() => {
+    let cancelled = false
+
+    const timeoutFetch = (url, options = {}, ms = 2500) => {
+      const ctrl = new AbortController()
+      const id = setTimeout(() => ctrl.abort(), ms)
+      return fetch(url, { ...options, signal: ctrl.signal })
+        .finally(() => clearTimeout(id))
+    }
+
+    const tryCandidates = async () => {
+      setError(null)
+      const stored = typeof window !== 'undefined' ? localStorage.getItem('apiBase') : null
+      const origin = typeof window !== 'undefined' ? window.location.origin : ''
+      const byPort = origin.replace('3000', '8000')
+
+      const candidates = [
+        ENV_API,
+        stored,
+        byPort,
+      ].filter(Boolean)
+
+      for (const base of candidates) {
+        try {
+          const res = await timeoutFetch(`${base}/test`, {}, 2000)
+          if (res.ok) {
+            const data = await res.json().catch(()=>({}))
+            if (!cancelled && data.backend) {
+              setApiBase(base)
+              localStorage.setItem('apiBase', base)
+              return
+            }
+          }
+        } catch (e) {
+          // continue
+        }
+      }
+      if (!cancelled) setError('Could not connect to the backend. Please enter the API URL.')
+    }
+
+    tryCandidates()
+    return () => { cancelled = true }
+  }, [])
+
+  const setManual = (base) => {
+    setApiBase(base)
+    try {
+      localStorage.setItem('apiBase', base)
+    } catch {}
+  }
+
+  return { apiBase, setManual, error }
+}
+
 export default function StageBoard({ mode }) {
+  const { apiBase, setManual, error: apiError } = useApiDiscovery()
   const [process, setProcess] = useState(null)
   const [loading, setLoading] = useState(true)
   const [logs, setLogs] = useState({})
+  const [error, setError] = useState(null)
+  const manualRef = useRef(null)
 
-  const fetchProcess = async () => {
+  const fetchProcess = async (base) => {
     setLoading(true)
-    await fetch(`${API}/api/seed`).catch(()=>{})
-    const res = await fetch(`${API}/api/process`)
-    const data = await res.json()
-    setProcess(data)
-    setLoading(false)
+    setError(null)
+    try {
+      await fetch(`${base}/api/seed`).catch(()=>{})
+      const res = await fetch(`${base}/api/process`)
+      if (!res.ok) throw new Error(`Process request failed: ${res.status}`)
+      const data = await res.json()
+      if (!data || !Array.isArray(data.stages)) throw new Error('Invalid process payload')
+      setProcess(data)
+    } catch (e) {
+      setError(e.message)
+    } finally {
+      setLoading(false)
+    }
   }
 
-  const fetchLogs = async () => {
-    const res = await fetch(`${API}/api/logs`)
-    const data = await res.json()
-    const group = {}
-    data.logs.forEach(l => {
-      const key = `${l.stage_key}:${l.item_key}`
-      group[key] = group[key] || []
-      group[key].push(l)
-    })
-    setLogs(group)
+  const fetchLogs = async (base) => {
+    if (!base) return
+    try {
+      const res = await fetch(`${base}/api/logs`)
+      if (!res.ok) return
+      const data = await res.json()
+      const group = {}
+      ;(data.logs || []).forEach(l => {
+        const key = `${l.stage_key}:${l.item_key}`
+        group[key] = group[key] || []
+        group[key].push(l)
+      })
+      setLogs(group)
+    } catch {}
   }
 
   useEffect(() => {
-    fetchProcess()
-  }, [])
+    if (!apiBase) return
+    fetchProcess(apiBase)
+  }, [apiBase])
 
   useEffect(() => {
-    fetchLogs()
-    const t = setInterval(fetchLogs, 1500)
+    if (!apiBase) return
+    fetchLogs(apiBase)
+    const t = setInterval(() => fetchLogs(apiBase), 1500)
     return () => clearInterval(t)
-  }, [])
+  }, [apiBase])
 
   const onUpload = async (stageKey, itemKey, file) => {
+    if (!apiBase) return
     const fd = new FormData()
     fd.append('item_key', itemKey)
     fd.append('stage_key', stageKey)
     fd.append('file', file)
     fd.append('actor', 'requester')
-    await fetch(`${API}/api/upload`, { method: 'POST', body: fd })
-    fetchLogs()
+    await fetch(`${apiBase}/api/upload`, { method: 'POST', body: fd })
+    fetchLogs(apiBase)
   }
 
   const onAssign = async (stageKey, itemKey, assignee) => {
-    await fetch(`${API}/api/assign`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ stage_key: stageKey, item_key: itemKey, assignee, actor: 'admin' }) })
-    fetchLogs()
+    if (!apiBase) return
+    await fetch(`${apiBase}/api/assign`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ stage_key: stageKey, item_key: itemKey, assignee, actor: 'admin' }) })
+    fetchLogs(apiBase)
   }
 
   const onAction = async (stageKey, itemKey, action) => {
-    await fetch(`${API}/api/action`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ stage_key: stageKey, item_key: itemKey, action, actor: mode === 'admin' ? 'admin' : 'assignee', note: action==='note' ? 'Added a note' : undefined }) })
-    fetchLogs()
+    if (!apiBase) return
+    await fetch(`${apiBase}/api/action`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ stage_key: stageKey, item_key: itemKey, action, actor: mode === 'admin' ? 'admin' : 'assignee', note: action==='note' ? 'Added a note' : undefined }) })
+    fetchLogs(apiBase)
+  }
+
+  if (!apiBase) {
+    return (
+      <div className="mx-auto max-w-6xl px-6 py-6">
+        <div className="flex items-start gap-3 p-4 rounded-lg border bg-amber-50 border-amber-200 text-amber-800">
+          <AlertTriangle className="w-5 h-5 mt-0.5" />
+          <div className="flex-1">
+            <div className="font-medium">Connecting to backend…</div>
+            <div className="text-sm opacity-90">{apiError ? apiError : 'Trying common URLs automatically.'}</div>
+            <div className="flex items-center gap-2 mt-3">
+              <div className="relative flex-1">
+                <input ref={manualRef} placeholder="Paste your API base URL (e.g., https://…-8000.modal.host)" className="w-full px-3 py-2 pr-10 border rounded-md text-sm" />
+                <LinkIcon className="w-4 h-4 text-slate-400 absolute right-3 top-1/2 -translate-y-1/2" />
+              </div>
+              <button onClick={() => manualRef.current?.value && setManual(manualRef.current.value.trim())} className="px-3 py-2 text-sm rounded-md bg-slate-900 text-white">Connect</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    )
   }
 
   if (loading || !process) {
@@ -151,8 +251,11 @@ export default function StageBoard({ mode }) {
       <div className="mx-auto max-w-6xl px-6 py-20 text-center">
         <div className="inline-flex items-center gap-3 px-4 py-2 rounded-full bg-white border shadow-sm">
           <Clock4 className="w-4 h-4 text-amber-500" />
-          <span className="text-slate-700">Loading process...</span>
+          <span className="text-slate-700">Loading process…</span>
         </div>
+        {error && (
+          <div className="mt-4 text-sm text-rose-600">{error}</div>
+        )}
       </div>
     )
   }
